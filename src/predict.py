@@ -1,15 +1,16 @@
-
 import joblib
 import pandas as pd
 import numpy as np
+import math
 from pathlib import Path
 
 # Paths
 BASE_DIR = Path(__file__).resolve().parent.parent
 MODEL_PATH = BASE_DIR / "models" / "model_v1.pkl"
+SCORE_MODEL_PATH = BASE_DIR / "models" / "score_model.pkl"
 DATA_PATH = BASE_DIR / "data" / "processed" / "matches_features.csv"
 
-# Feature columns expected by the model
+# Feature columns expected by the models
 FEATURE_COLS = [
     'HomeElo', 'AwayElo', 'EloDiff',
     'Home_Form_5', 'Away_Form_5', 'Diff_Form_5',
@@ -23,15 +24,22 @@ FEATURE_COLS = [
 ]
 
 
-def get_latest_team_stats(team_name, df):
+def poisson_pmf(k: int, lam: float) -> float:
+    """Calculates Poisson probability for k goals with expected mean lam."""
+    if lam <= 0:
+        return 1.0 if k == 0 else 0.0
+    return (math.exp(-lam) * (lam ** k)) / math.factorial(k)
+
+
+def get_latest_team_stats(team_name: str, df: pd.DataFrame) -> dict:
     """Fetches the most recent pre-match stats for a team."""
-    # Look for the team's most recent match as either Home or Away
     team_matches = df[(df['HomeTeam'] == team_name) | (df['AwayTeam'] == team_name)].sort_values('Date')
     if team_matches.empty:
-        raise ValueError(f"Team '{team_name}' not found in dataset!")
+        available = sorted(list(set(df['HomeTeam']).union(set(df['AwayTeam']))))
+        raise ValueError(f"Team '{team_name}' not found. Available teams: {', '.join(available[:10])}...")
     
     last_match = team_matches.iloc[-1]
-    is_home = last_match['HomeTeam'] == team_name
+    is_home = (last_match['HomeTeam'] == team_name)
     
     return {
         'Elo': last_match['HomeElo'] if is_home else last_match['AwayElo'],
@@ -46,12 +54,13 @@ def get_latest_team_stats(team_name, df):
     }
 
 
-def predict_match(home_team: str, away_team: str):
-    # 1. Load model and dataset
-    model = joblib.load(MODEL_PATH)
+def predict_match(home_team: str, away_team: str) -> dict:
+    # 1. Load models and dataset
+    outcome_model = joblib.load(MODEL_PATH)
+    score_models = joblib.load(SCORE_MODEL_PATH)
     df = pd.read_csv(DATA_PATH, low_memory=False)
     
-    # 2. Get latest stats for both teams
+    # 2. Get latest stats
     home_stats = get_latest_team_stats(home_team, df)
     away_stats = get_latest_team_stats(away_team, df)
     
@@ -94,20 +103,59 @@ def predict_match(home_team: str, away_team: str):
     
     X_input = pd.DataFrame([input_dict])[FEATURE_COLS]
     
-    # 5. Predict probabilities: [Class 0: Home Win, Class 1: Draw, Class 2: Away Win]
-    probs = model.predict_proba(X_input)[0]
+    # 5. Outcome Probabilities: [Home Win, Draw, Away Win]
+    probs = outcome_model.predict_proba(X_input)[0]
     
-    print(f"\n==========================================")
+    # 6. Expected Goals (xG)
+    exp_h_goals = float(score_models["home_goals_model"].predict(X_input)[0])
+    exp_a_goals = float(score_models["away_goals_model"].predict(X_input)[0])
+    
+    # 7. Exact Score Probabilities (0-0 up to 5-5)
+    score_grid = {}
+    for h in range(6):
+        for a in range(6):
+            p = poisson_pmf(h, exp_h_goals) * poisson_pmf(a, exp_a_goals)
+            score_grid[f"{h} - {a}"] = float(p)
+            
+    # Normalize score grid
+    total_grid_prob = sum(score_grid.values())
+    for k in score_grid:
+        score_grid[k] /= total_grid_prob
+        
+    most_likely_score = max(score_grid, key=score_grid.get)
+    top_scores = sorted(score_grid.items(), key=lambda x: x[1], reverse=True)[:5]
+    
+    # Print clean summary
+    print(f"\n=======================================================")
     print(f"      PREDICTION: {home_team} vs {away_team}")
-    print(f"==========================================")
-    print(f"  ⚽ Home Win ({home_team}): {probs[0]*100:.1f}%")
-    print(f"  🤝 Draw:                  {probs[1]*100:.1f}%")
-    print(f"  ⚽ Away Win ({away_team}): {probs[2]*100:.1f}%")
-    print(f"==========================================\n")
+    print(f"=======================================================")
+    print(f"  PREDICTED SCORE:     {home_team} {most_likely_score} {away_team}")
+    print(f"  Expected Goals (xG): {home_team} {exp_h_goals:.2f} - {exp_a_goals:.2f} {away_team}")
+    print(f"-------------------------------------------------------")
+    print(f"  Outcome Probabilities:")
+    print(f"    Home Win ({home_team}): {probs[0]*100:.1f}%")
+    print(f"    Draw:                  {probs[1]*100:.1f}%")
+    print(f"    Away Win ({away_team}): {probs[2]*100:.1f}%")
+    print(f"-------------------------------------------------------")
+    print(f"  Top Most Likely Scorelines:")
+    for score, prob in top_scores[:3]:
+        print(f"    {score:<7} -> {prob*100:.1f}%")
+    print(f"=======================================================\n")
     
-    return {"Home Win": probs[0], "Draw": probs[1], "Away Win": probs[2]}
+    return {
+        "home_team": home_team,
+        "away_team": away_team,
+        "predicted_score": most_likely_score,
+        "exp_home_goals": round(exp_h_goals, 2),
+        "exp_away_goals": round(exp_a_goals, 2),
+        "probabilities": {
+            "Home Win": float(probs[0]),
+            "Draw": float(probs[1]),
+            "Away Win": float(probs[2])
+        },
+        "top_scores": top_scores
+    }
 
 
 if __name__ == "__main__":
-    # Test an example match!
     predict_match("Arsenal", "Chelsea")
